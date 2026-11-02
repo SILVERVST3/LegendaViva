@@ -25,17 +25,21 @@ O LegendaViva ouve o som que está tocando no PC (navegador, VLC, qualquer coisa
 | Tamanho da letra | roda do mouse |
 | Menu (pausar, mostrar hebraico, configurações, sair) | botão direito |
 
-## Desempenho e placa de vídeo
-O app tem dois "motores" de reconhecimento (Configurações → Motor de reconhecimento):
+## Como o atraso foi reduzido
+- **Legenda provisória (cinza)**: enquanto a pessoa fala, o app reconhece de novo o áudio da frase toda vez que a placa fica livre, e mostra a tradução provisória em cinza. Quando a frase termina, faz uma passada final mais caprichada e o texto fica **branco**. Técnica baseada no Whisper-Streaming (Universidade Carlos, Praga).
+- O ritmo das passadas se ajusta sozinho à velocidade da placa: nunca acumula atraso.
+- Frases cortadas nas pausas da fala (300 ms), para não partir palavras.
+- Tradução com conexão reaproveitada (sem refazer a conexão segura a cada frase) e cache: se a frase final é igual à última provisória, a tradução é instantânea.
+- Passadas provisórias usam decodificação gulosa e sem re-tentativas; a final usa beam search quando a placa dá conta.
 
-- **whisper.cpp + Vulkan** (padrão quando disponível): usa a placa de vídeo **AMD Radeon (ex.: RX 580)**, Intel ou NVIDIA via Vulkan. Na 1ª vez baixa o modelo de hebraico da ivrit.ai no formato GGML (~1,5 GB). A barra mostra "GPU Vulkan: <nome da placa>" quando está usando a placa.
-  - Mantenha o **driver AMD Adrenalin** atualizado (é ele que fornece o Vulkan).
-  - **Modo rápido da placa de vídeo**: processa só a parte da janela do Whisper que tem áudio. Nos testes ficou 4–5× mais rápido; pode errar um pouco mais. Vale testar ligado e desligado.
-- **faster-whisper**: processador (ou NVIDIA com CUDA). É o reserva automático se o Vulkan falhar.
+## Placa de vídeo
+- **whisper.cpp + Vulkan** (padrão): usa a placa AMD Radeon (ex.: RX 580). A barra mostra "GPU Vulkan: <placa>". Mantenha o driver **AMD Adrenalin** atualizado.
+- **faster-whisper**: processador (ou NVIDIA com CUDA), usado como reserva.
+- "Encoder encurtado" ficou como **experimental e desligado**: pesquisas mostram que com o modelo turbo ele multiplica os erros.
 
-Dicas:
-- O Whisper gasta quase o mesmo tempo para um trecho curto ou longo (exceto no modo rápido). Se o PC não der conta, o app **aumenta o trecho sozinho** (a barra mostra "trechos de Xs (PC lento)"), para não acumular atraso.
-- Diminuir o "tamanho do trecho" deixa a legenda mais rápida, mas a tradução fica um pouco pior (frases menores).
+## Ajuste fino
+- **Tamanho máx. da frase**: com legenda provisória, 5–8 s é o ideal (frases maiores = tradução melhor, sem aumentar o atraso).
+- No `log.txt`, as linhas `[parcial X s]` e `[final X s]` mostram quanto a placa leva por passada.
 
 ## Arquivos
 Configuração e logs ficam em `%APPDATA%\LegendaViva\` (menu → "Abrir pasta do log"). Se algo der errado, mande o `log.txt` e o `whisper-server.log`.

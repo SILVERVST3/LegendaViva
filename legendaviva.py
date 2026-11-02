@@ -69,17 +69,22 @@ DEFAULTS = {
     "device": "auto",          # auto / cuda / cpu
     "translator": "auto",      # auto / online / offline
     "engine": "auto",          # auto (Vulkan se existir) / vulkan / faster-whisper
-    "fast_encoder": False,     # whisper.cpp: encoder encurtado (mais rápido)
+    "fast_encoder": False,     # whisper.cpp: encoder encurtado (NÃO recomendado p/ turbo)
+    "partials": True,          # legenda provisória enquanto a frase é falada
+    "partial_step": 0.5,       # s de áudio novo entre passadas provisórias
     "ggml_model_path": "",     # opcional: caminho de um .bin GGML já baixado
     "loopback_device": "",     # "" = saída de som padrão do Windows
     "show_original": False,
     "font_size": 26,
     "max_lines": 2,
-    "chunk_seconds": 5.0,      # tamanho alvo de cada trecho de áudio
+    "chunk_seconds": 6.0,      # tamanho máximo alvo de cada frase (com legenda provisória)
     "opacity": 0.82,
     "clear_after": 12,         # some com a legenda após N s sem fala
     "geometry": "",
 }
+
+
+CFG_VERSION = 2
 
 
 def load_cfg():
@@ -89,6 +94,12 @@ def load_cfg():
             cfg.update(json.load(f))
     except Exception:
         pass
+    if int(cfg.get("cfg_version", 1)) < CFG_VERSION:
+        # v2: legenda provisória -> frases maiores dão tradução melhor sem aumentar o atraso
+        cfg["chunk_seconds"] = DEFAULTS["chunk_seconds"]
+        cfg["fast_encoder"] = False
+        cfg["partials"] = True
+        cfg["cfg_version"] = CFG_VERSION
     return cfg
 
 
@@ -213,10 +224,10 @@ def decide_cut(buf, rate, target_s, flush=False):
     if n == 0:
         return None
     dur = n * FRAME_S
-    min_s = 1.2
+    min_s = 1.0
     max_s = target_s + 3.0
 
-    if flush and dur >= 0.6:
+    if flush and dur >= 0.4:
         return n * frame
 
     # Só silêncio/ruído baixíssimo: descarta tudo
@@ -227,8 +238,8 @@ def decide_cut(buf, rate, target_s, flush=False):
     thr = max(0.0005, 0.35 * float(np.percentile(e, 50)))
     quiet = smooth < thr
 
-    # 1) Pausa de >= 400 ms no fim depois de fala suficiente -> corta já
-    pause_frames = int(0.4 / FRAME_S)
+    # 1) Pausa de >= 300 ms no fim depois de fala suficiente -> corta já
+    pause_frames = int(0.3 / FRAME_S)
     if dur >= min_s and n > pause_frames and quiet[-pause_frames:].all():
         return (n - pause_frames // 2) * frame
 
@@ -293,21 +304,31 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
 
+_SESSION = None
+
+
+def http():
+    """Sessão HTTP com keep-alive: evita refazer a conexão TLS (~0,2-0,4 s) a cada frase."""
+    global _SESSION
+    if _SESSION is None:
+        import requests
+        _SESSION = requests.Session()
+        _SESSION.headers["User-Agent"] = UA
+    return _SESSION
+
+
 def tr_google(text):
-    import requests
-    r = requests.get("https://translate.googleapis.com/translate_a/single",
+    r = http().get("https://translate.googleapis.com/translate_a/single",
                      params={"client": "gtx", "sl": "iw", "tl": "pt", "dt": "t", "q": text},
-                     headers={"User-Agent": UA}, timeout=8)
+                     timeout=5)
     r.raise_for_status()
     data = r.json()
     return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
 
 
 def tr_mymemory(text):
-    import requests
-    r = requests.get("https://api.mymemory.translated.net/get",
-                     params={"q": text, "langpair": "he|pt-BR"},
-                     headers={"User-Agent": UA}, timeout=8)
+    r = http().get("https://api.mymemory.translated.net/get",
+                   params={"q": text, "langpair": "he|pt-BR"}, timeout=6)
     r.raise_for_status()
     j = r.json()
     if int(j.get("responseStatus", 0)) != 200:
@@ -363,6 +384,7 @@ class Translator:
         self.offline_failed = False
         self.cooldown = {}
         self.last_used = None
+        self.cache = {}
         if mode == "offline":
             self._get_offline()
 
@@ -375,11 +397,26 @@ class Translator:
                 log("falha no tradutor offline:", traceback.format_exc())
         return self.offline
 
-    def __call__(self, text):
+    def __call__(self, text, partial=False):
+        """partial=True: legenda provisória. Usa só serviços rápidos e sem cota
+        (Google ou offline já carregado), para não gastar o limite do MyMemory."""
+        if text in self.cache:
+            self.last_used = "cache"
+            return self.cache[text]
+        out = self._translate(text, partial)
+        if out:
+            self.cache[text] = out
+            if len(self.cache) > 300:
+                self.cache.pop(next(iter(self.cache)))
+        return out
+
+    def _translate(self, text, partial):
         providers = []
         if self.mode in ("auto", "online"):
-            providers += [("Google", tr_google, 120), ("MyMemory", tr_mymemory, 600)]
-        if self.mode in ("auto", "offline"):
+            providers.append(("Google", tr_google, 120))
+            if not partial:
+                providers.append(("MyMemory", tr_mymemory, 600))
+        if self.mode == "offline" or (self.mode == "auto" and (not partial or self.offline)):
             providers.append(("Offline", None, 0))
         now = time.time()
         for name, fn, penalty in providers:
@@ -444,12 +481,14 @@ class FasterWhisperBackend:
         self.model, self.dev = load_model(cfg["model"], cfg["device"], on_status)
         self.label = "GPU NVIDIA" if self.dev == "cuda" else "CPU"
         self.slow = self.dev != "cuda"
+        self.final_beam = 1 if self.slow else 3
 
-    def transcribe(self, audio16, prompt):
+    def transcribe(self, audio16, prompt, final=True):
         segments, _ = self.model.transcribe(
             audio16, language="he", task="transcribe",
-            beam_size=5 if self.dev == "cuda" else 1,
-            vad_filter=True, vad_parameters=dict(min_silence_duration_ms=300),
+            beam_size=(self.final_beam if final else 1),
+            temperature=[0.0, 0.2, 0.4] if final else [0.0],
+            vad_filter=final, vad_parameters=dict(min_silence_duration_ms=300),
             condition_on_previous_text=False, initial_prompt=prompt or None,
             without_timestamps=True, no_speech_threshold=0.6,
         )
@@ -562,7 +601,9 @@ class WhisperCppBackend:
 
         self.label = self._detect_gpu()
         self.slow = self.label == "CPU"
+        self.final_beam = 1 if self.slow else 3
         self.audio_ctx = bool(cfg.get("fast_encoder", False))
+        self.session = requests.Session()
         # aquecimento (a 1ª execução no Vulkan compila os shaders)
         on_status(f"Preparando {self.label}…")
         try:
@@ -584,13 +625,14 @@ class WhisperCppBackend:
             pass
         return "CPU"
 
-    def transcribe(self, audio16, prompt):
+    def transcribe(self, audio16, prompt, final=True):
         data = {
             "language": "he",
             "response_format": "verbose_json",
             "temperature": "0.0",
-            "temperature_inc": "0.2",
-            "beam_size": "1" if self.slow else "5",
+            # parcial: sem re-tentativas com temperatura maior (cada uma repete o trabalho)
+            "temperature_inc": "0.2" if final else "0.0",
+            "beam_size": str(self.final_beam if final else 1),
             "no_timestamps": "true",
             "no_language_probabilities": "true",
             "suppress_non_speech": "true",
@@ -602,7 +644,7 @@ class WhisperCppBackend:
             secs = len(audio16) / 16000.0
             data["audio_ctx"] = str(int(min(1500, max(256, secs * 50 + 64))))
         files = {"file": ("trecho.wav", wav_bytes(audio16), "audio/wav")}
-        r = self.requests.post(self.url + "/inference", data=data, files=files, timeout=120)
+        r = self.session.post(self.url + "/inference", data=data, files=files, timeout=120)
         r.raise_for_status()
         j = r.json()
         if "error" in j:
@@ -658,6 +700,10 @@ class Engine:
         self.capture = None
         self.n_chunks = 0
         self.n_silent = 0
+        self.tr_lock = threading.Lock()
+        self.tr_evt = threading.Event()
+        self.tr_finals = deque()
+        self.tr_partial = None
         self.worker = threading.Thread(target=self._run, daemon=True)
 
     def status(self, msg):
@@ -691,7 +737,6 @@ class Engine:
             return
 
         # A tradução roda numa thread separada para não atrasar o reconhecimento
-        self.tr_q = queue.Queue()
         threading.Thread(target=self._translate_loop, daemon=True).start()
 
         self.capture = AudioCapture(self.audio_q, self.cfg["loopback_device"], self.status)
@@ -709,18 +754,42 @@ class Engine:
         finally:
             backend.close()
 
+    def _prep16(self, x, rate):
+        a = to_16k(x, rate)
+        # normaliza o volume (áudio baixo atrapalha o reconhecimento)
+        peak = float(np.max(np.abs(a))) if len(a) else 0.0
+        if 0 < peak < 0.5:
+            a = (a * min(20.0, 0.5 / peak)).astype(np.float32)
+        return a
+
     def _loop(self, backend, rate, dev_txt):
+        """
+        Estratégia de baixa latência (inspirada no Whisper-Streaming):
+          - o áudio da frase atual vai crescendo num buffer;
+          - sempre que a placa de vídeo fica livre e chegou áudio novo, o buffer
+            inteiro é reconhecido de novo e vira uma LEGENDA PROVISÓRIA (cinza);
+          - quando a frase termina (pausa na fala ou tamanho máximo), é feita a
+            passada FINAL (branca), com mais qualidade, e o buffer recomeça.
+        O ritmo das passadas se ajusta sozinho à velocidade do PC.
+        """
         buf = np.zeros(0, dtype=np.float32)
         last_audio = time.time()
         prev_text = ""
         base_target = float(self.cfg["chunk_seconds"])
         target = base_target
-        proc_ema = None  # tempo médio que o Whisper leva por trecho
+        partials = bool(self.cfg.get("partials", True))
+        step = float(self.cfg.get("partial_step", 0.5))
+        proc_final = None
+        proc_part = None
+        seg_id = 0
+        last_part_len = 0
+        last_part_text = ""
+        seg_start_time = None   # quando começou a chegar a fala da frase atual
 
         while not self.stop_evt.is_set():
             got = False
             try:
-                blocks = [self.audio_q.get(timeout=0.2)]
+                blocks = [self.audio_q.get(timeout=0.05 if len(buf) else 0.2)]
                 got = True
                 while True:
                     blocks.append(self.audio_q.get_nowait())
@@ -730,65 +799,100 @@ class Engine:
                 last_audio = time.time()
                 if self.paused.is_set():
                     buf = np.zeros(0, dtype=np.float32)
+                    last_part_len = 0
                     continue
                 buf = np.concatenate([buf] + blocks)
                 self._report_level(blocks)
 
-            # O loopback não manda nada quando o PC está mudo:
-            # se parou de chegar áudio, processa o que sobrou.
-            flush = (not got) and (time.time() - last_audio > 0.6) and len(buf) > 0
+            flush = (not got) and (time.time() - last_audio > 0.4) and len(buf) > 0
 
-            # PC lento: não deixa o atraso crescer sem limite
             max_keep = int(rate * (target + 3.0) * 3)
             if len(buf) > max_keep:
                 buf = buf[-int(rate * (target + 3.0)):]
-                self.status(f"● Ouvindo ({dev_txt}) - atrasado, use um modelo mais leve")
+                last_part_len = 0
+                self.status(f"● Ouvindo ({dev_txt}) - atrasado")
 
+            # ---------- passada FINAL ----------
             cut = decide_cut(buf, rate, target, flush=flush)
-            if cut is None:
-                if flush and len(buf) < int(rate * 0.6):
-                    buf = np.zeros(0, dtype=np.float32)
+            if cut is not None:
+                chunk, buf = buf[:cut], buf[cut:]
+                last_part_len = 0
+                last_part_text = ""
+                rms = float(np.sqrt(np.mean(chunk * chunk))) if len(chunk) else 0.0
+                if rms < 0.0005:
+                    self.n_silent += 1
+                    self.ui_q.put(("clear_partial", seg_id))
+                    seg_id += 1
+                    continue
+                self.n_chunks += 1
+                t0 = time.time()
+                try:
+                    he = backend.transcribe(self._prep16(chunk, rate), prev_text[-120:], final=True)
+                except Exception as e:
+                    log("erro no reconhecimento:", traceback.format_exc())
+                    self.status(f"Erro no reconhecimento: {e}")
+                    time.sleep(0.5)
+                    continue
+                proc = time.time() - t0
+                proc_final = proc if proc_final is None else 0.7 * proc_final + 0.3 * proc
+
+                # Ajustes automáticos conforme a velocidade da placa/CPU
+                if hasattr(backend, "final_beam") and not backend.slow:
+                    backend.final_beam = 3 if proc_final < 1.2 else 1
+                budget = proc_final + (proc_part or 0) * 1.5
+                new_target = min(20.0, max(base_target, budget * 1.15))
+                if abs(new_target - target) > 0.5:
+                    target = new_target
+                    extra = "" if target <= base_target + 0.1 else f" - frases de até {target:.0f}s (PC lento)"
+                    self.status(f"● Ouvindo ({dev_txt}){extra}")
+
+                he = clean_text(he)
+                if not he or is_hallucination(he):
+                    log(f"[final {proc:.2f}s] (descartado) {he}")
+                    self.ui_q.put(("clear_partial", seg_id))
+                    seg_id += 1
+                    continue
+                prev_text = he
+                log(f"[final {proc:.2f}s / áudio {len(chunk) / rate:.1f}s] HE: {he}")
+                self._put_translation(("final", seg_id, he, time.time()))
+                seg_id += 1
                 continue
-            chunk, buf = buf[:cut], buf[cut:]
 
-            rms = float(np.sqrt(np.mean(chunk * chunk)))
-            if rms < 0.0005:
-                self.n_silent += 1
-                continue  # silêncio
-            self.n_chunks += 1
-
-            audio16 = to_16k(chunk, rate)
-            # normaliza o volume (áudio baixo atrapalha o reconhecimento)
-            peak = float(np.max(np.abs(audio16))) or 1.0
-            if peak < 0.5:
-                audio16 = (audio16 * min(20.0, 0.5 / peak)).astype(np.float32)
+            # ---------- passada PROVISÓRIA ----------
+            if not partials:
+                continue
+            if len(buf) < int(rate * 0.8) or len(buf) - last_part_len < int(rate * step):
+                continue
+            tail = buf[-int(rate * 0.4):]
+            if float(np.sqrt(np.mean(tail * tail))) < 0.0005 and \
+                    float(np.sqrt(np.mean(buf * buf))) < 0.0005:
+                continue
             t0 = time.time()
             try:
-                he = backend.transcribe(audio16, prev_text[-200:])
+                he = backend.transcribe(self._prep16(buf, rate), prev_text[-120:], final=False)
             except Exception as e:
-                log("erro no reconhecimento:", traceback.format_exc())
-                self.status(f"Erro no reconhecimento: {e}")
-                time.sleep(1)
+                log("erro na legenda provisória:", e)
+                last_part_len = len(buf)
                 continue
-
-            # O Whisper sempre processa uma janela de 30 s, então cada trecho
-            # custa quase o mesmo tempo, curto ou longo. Se o PC demora mais
-            # que o tamanho do trecho, aumenta o trecho para não acumular atraso.
             proc = time.time() - t0
-            proc_ema = proc if proc_ema is None else 0.7 * proc_ema + 0.3 * proc
-            new_target = min(20.0, max(base_target, proc_ema * 1.15))
-            if abs(new_target - target) > 0.5:
-                target = new_target
-                extra = "" if target <= base_target + 0.1 else f" - trechos de {target:.0f}s (PC lento)"
-                self.status(f"● Ouvindo ({dev_txt}){extra}")
-
+            proc_part = proc if proc_part is None else 0.7 * proc_part + 0.3 * proc
+            last_part_len = len(buf)
             he = clean_text(he)
-            if not he or is_hallucination(he):
-                log(f"[{proc:.1f}s] (descartado) {he}")
-                continue
-            prev_text = he
-            log(f"[{proc:.1f}s / áudio {len(chunk) / rate:.1f}s] HE: {he}")
-            self.tr_q.put(he)
+            if he and he != last_part_text and not is_hallucination(he):
+                last_part_text = he
+                log(f"[parcial {proc:.2f}s / áudio {len(buf) / rate:.1f}s] {he}")
+                self._put_translation(("partial", seg_id, he, time.time()))
+
+    def _put_translation(self, item):
+        with self.tr_lock:
+            if item[0] == "final":
+                self.tr_finals.append(item)
+                # parcial antigo da mesma frase não interessa mais
+                if self.tr_partial and self.tr_partial[1] <= item[1]:
+                    self.tr_partial = None
+            else:
+                self.tr_partial = item  # só a mais recente importa
+        self.tr_evt.set()
 
     def _report_level(self, blocks):
         lvl = max(float(np.sqrt(np.mean(b * b))) for b in blocks if len(b))
@@ -811,14 +915,36 @@ class Engine:
             log("erro tradutor:", traceback.format_exc())
             self.status(f"Erro no tradutor: {e}")
             translator = None
+        last_partial_call = 0.0
         while not self.stop_evt.is_set():
-            try:
-                he = self.tr_q.get(timeout=0.3)
-            except queue.Empty:
+            self.tr_evt.wait(0.3)
+            with self.tr_lock:
+                item = None
+                if self.tr_finals:
+                    item = self.tr_finals.popleft()
+                elif self.tr_partial and time.time() - last_partial_call >= 0.6:
+                    # limite de ~1,6 traduções provisórias/s para o Google não bloquear
+                    item, self.tr_partial = self.tr_partial, None
+                if not self.tr_finals and not self.tr_partial:
+                    self.tr_evt.clear()
+            if item is None:
+                if self.tr_partial:
+                    time.sleep(0.05)
                 continue
-            pt = translator(he) if translator else None
-            log(f"PT ({translator.last_used if translator else '-'}): {pt}")
-            self.ui_q.put(("text", he, pt))
+            kind, sid, he, t_rec = item
+            t0 = time.time()
+            if kind == "partial":
+                last_partial_call = t0
+            pt = translator(he, partial=(kind == "partial")) if translator else None
+            dt = time.time() - t0
+            if kind == "final":
+                log(f"PT ({translator.last_used if translator else '-'}, {dt:.2f}s): {pt}")
+                self.ui_q.put(("text", sid, he, pt))
+            elif pt:
+                with self.tr_lock:
+                    stale = any(f[1] >= sid for f in self.tr_finals)
+                if not stale:
+                    self.ui_q.put(("partial", sid, he, pt))
 
 
 # --------------------------------------------------------------------------
@@ -856,6 +982,12 @@ class Overlay(tk.Tk):
         self.text_lbl = tk.Label(self, text="", bg=self.BG, fg="#ffffff",
                                  font=("Segoe UI", int(self.cfg["font_size"]), "bold"),
                                  justify="center")
+        # legenda provisória (enquanto a frase ainda está sendo falada)
+        self.part_lbl = tk.Label(self, text="", bg=self.BG, fg="#b5b5b5",
+                                 font=("Segoe UI", int(self.cfg["font_size"]), "bold"),
+                                 justify="center")
+        self.partial = None   # (seg_id, he, pt)
+        self.last_final_sid = -1
         self._pack_labels()
 
         self.grip = tk.Label(self, text="◢", bg=self.BG, fg="#555555",
@@ -863,7 +995,7 @@ class Overlay(tk.Tk):
         self.grip.place(relx=1.0, rely=1.0, anchor="se")
 
         # Arrastar / redimensionar / fonte / menu
-        for w in (self, self.status_lbl, self.text_lbl, self.orig_lbl):
+        for w in (self, self.status_lbl, self.text_lbl, self.orig_lbl, self.part_lbl):
             w.bind("<ButtonPress-1>", self._start_move)
             w.bind("<B1-Motion>", self._on_move)
             w.bind("<ButtonRelease-1>", lambda e: self._remember_geometry())
@@ -895,9 +1027,11 @@ class Overlay(tk.Tk):
     def _pack_labels(self):
         self.orig_lbl.pack_forget()
         self.text_lbl.pack_forget()
+        self.part_lbl.pack_forget()
         if self.cfg["show_original"]:
             self.orig_lbl.pack(fill="x", padx=14)
-        self.text_lbl.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        self.text_lbl.pack(fill="x", padx=14)
+        self.part_lbl.pack(fill="x", padx=14, pady=(0, 8))
         self._update_wrap()
 
     def _update_wrap(self):
@@ -905,6 +1039,7 @@ class Overlay(tk.Tk):
             w = max(200, self.winfo_width() - 40)
             self.text_lbl.configure(wraplength=w)
             self.orig_lbl.configure(wraplength=w)
+            self.part_lbl.configure(wraplength=w)
         except tk.TclError:
             pass
 
@@ -928,10 +1063,23 @@ class Overlay(tk.Tk):
                     self.level = item[1]
                     self._show_status()
                 elif kind == "text":
-                    _, he, pt = item
+                    _, sid, he, pt = item
                     self.lines.append((he, pt or f"(sem tradução) {he}"))
+                    self.last_final_sid = max(self.last_final_sid, sid)
+                    if self.partial and self.partial[0] <= sid:
+                        self.partial = None
                     self.last_text_time = time.time()
                     self._render()
+                elif kind == "partial":
+                    _, sid, he, pt = item
+                    if sid > self.last_final_sid:
+                        self.partial = (sid, he, pt)
+                        self.last_text_time = time.time()
+                        self._render()
+                elif kind == "clear_partial":
+                    if self.partial and self.partial[0] <= item[1]:
+                        self.partial = None
+                        self._render()
                 elif kind == "error":
                     self.text_lbl.configure(text="Não consegui iniciar. Botão direito → Configurações\n"
                                                  "(tente CPU ou um modelo menor).")
@@ -940,7 +1088,7 @@ class Overlay(tk.Tk):
         clear_after = float(self.cfg.get("clear_after", 0) or 0)
         if clear_after and self.lines and time.time() - self.last_text_time > clear_after:
             self.clear()
-        self.after(100, self._poll)
+        self.after(30, self._poll)
 
     def _show_status(self):
         txt = getattr(self, "status_txt", "")
@@ -956,11 +1104,18 @@ class Overlay(tk.Tk):
         self.status_lbl.configure(text=txt)
 
     def _render(self):
-        self.text_lbl.configure(text="\n".join(pt for _, pt in self.lines))
-        self.orig_lbl.configure(text="\n".join(he for he, _ in self.lines))
+        n = int(self.cfg["max_lines"])
+        finals = list(self.lines)
+        if self.partial:
+            finals = finals[-(n - 1):] if n > 1 else []
+        self.text_lbl.configure(text="\n".join(pt for _, pt in finals))
+        self.part_lbl.configure(text=self.partial[2] if self.partial else "")
+        he_lines = [he for he, _ in finals] + ([self.partial[1]] if self.partial else [])
+        self.orig_lbl.configure(text="\n".join(he_lines))
 
     def clear(self):
         self.lines.clear()
+        self.partial = None
         self._render()
 
     def toggle_pause(self):
@@ -1004,6 +1159,7 @@ class Overlay(tk.Tk):
         size = min(72, max(12, size))
         self.cfg["font_size"] = size
         self.text_lbl.configure(font=("Segoe UI", size, "bold"))
+        self.part_lbl.configure(font=("Segoe UI", size, "bold"))
         save_cfg(self.cfg)
 
     def _menu(self, e):
@@ -1019,7 +1175,7 @@ class Overlay(tk.Tk):
 
     def apply_settings(self, new_cfg):
         restart = any(new_cfg[k] != self.cfg[k] for k in
-                      ("model", "device", "loopback_device", "chunk_seconds", "translator", "engine", "fast_encoder"))
+                      ("model", "device", "loopback_device", "chunk_seconds", "translator", "engine", "fast_encoder", "partials"))
         self.cfg.update(new_cfg)
         save_cfg(self.cfg)
         self.attributes("-alpha", float(self.cfg["opacity"]))
@@ -1072,11 +1228,11 @@ class SettingsWindow(tk.Toplevel):
         ttk.Combobox(self, textvariable=self.lb_var, values=["(padrão do Windows)"] + devs,
                      state="readonly", width=42).grid(row=3, column=1, **pad)
 
-        ttk.Label(self, text="Tamanho do trecho (s):").grid(row=4, column=0, **pad)
+        ttk.Label(self, text="Tamanho máx. da frase (s):").grid(row=4, column=0, **pad)
         self.chunk_var = tk.DoubleVar(value=float(cfg["chunk_seconds"]))
         ttk.Spinbox(self, from_=3, to=10, increment=0.5, textvariable=self.chunk_var,
                     width=6).grid(row=4, column=1, **pad)
-        ttk.Label(self, text="Menor = legenda mais rápida; maior = tradução com mais contexto.",
+        ttk.Label(self, text="Com legenda provisória ligada, 5–8 s é o ideal (o atraso não aumenta).",
                   foreground="#555").grid(row=5, column=0, columnspan=2, padx=10, sticky="w")
 
         ttk.Label(self, text="Linhas na tela:").grid(row=6, column=0, **pad)
@@ -1119,11 +1275,15 @@ class SettingsWindow(tk.Toplevel):
                       foreground="#a00").grid(row=12, column=1, padx=10, sticky="w")
 
         self.fast_var = tk.BooleanVar(value=bool(cfg.get("fast_encoder", False)))
-        ttk.Checkbutton(self, text="Modo rápido da placa de vídeo (encoder encurtado; pode errar um pouco mais)",
+        ttk.Checkbutton(self, text="Encoder encurtado (experimental, NÃO recomendado: erra muito com o modelo turbo)",
                         variable=self.fast_var).grid(row=13, column=0, columnspan=2, **pad)
 
+        self.part_var = tk.BooleanVar(value=bool(cfg.get("partials", True)))
+        ttk.Checkbutton(self, text="Legenda provisória (cinza) enquanto a frase é falada — menor atraso",
+                        variable=self.part_var).grid(row=14, column=0, columnspan=2, **pad)
+
         btns = ttk.Frame(self)
-        btns.grid(row=14, column=0, columnspan=2, pady=10)
+        btns.grid(row=15, column=0, columnspan=2, pady=10)
         ttk.Button(btns, text="Salvar", command=self.save).pack(side="left", padx=5)
         ttk.Button(btns, text="Cancelar", command=self.destroy).pack(side="left", padx=5)
 
@@ -1144,6 +1304,7 @@ class SettingsWindow(tk.Toplevel):
                 "engine": next((k for k, v in self.eng_labels.items()
                                 if v == self.eng_var.get()), "auto"),
                 "fast_encoder": bool(self.fast_var.get()),
+                "partials": bool(self.part_var.get()),
             }
         except Exception as e:
             messagebox.showerror(APP, f"Valor inválido: {e}", parent=self)
