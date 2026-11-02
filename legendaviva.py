@@ -67,6 +67,10 @@ MODELS = [
 DEFAULTS = {
     "model": MODELS[0][0],
     "device": "auto",          # auto / cuda / cpu
+    "translator": "auto",      # auto / online / offline
+    "engine": "auto",          # auto (Vulkan se existir) / vulkan / faster-whisper
+    "fast_encoder": False,     # whisper.cpp: encoder encurtado (mais rápido)
+    "ggml_model_path": "",     # opcional: caminho de um .bin GGML já baixado
     "loopback_device": "",     # "" = saída de som padrão do Windows
     "show_original": False,
     "font_size": 26,
@@ -267,6 +271,14 @@ HALLUCINATIONS = [
 ]
 
 
+_BIDI = dict.fromkeys(map(ord, "\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"), None)
+
+
+def clean_text(text):
+    """Remove marcas invisíveis de direção (RTL) e espaços extras."""
+    return " ".join(text.translate(_BIDI).split())
+
+
 def is_hallucination(text):
     t = text.strip(" .!?,-\"'")
     if len(t) < 2:
@@ -277,20 +289,116 @@ def is_hallucination(text):
     return False
 
 
-class Translator:
-    def __init__(self):
-        from deep_translator import GoogleTranslator
-        self.tr = GoogleTranslator(source="iw", target="pt")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+
+
+def tr_google(text):
+    import requests
+    r = requests.get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "iw", "tl": "pt", "dt": "t", "q": text},
+                     headers={"User-Agent": UA}, timeout=8)
+    r.raise_for_status()
+    data = r.json()
+    return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
+
+
+def tr_mymemory(text):
+    import requests
+    r = requests.get("https://api.mymemory.translated.net/get",
+                     params={"q": text, "langpair": "he|pt-BR"},
+                     headers={"User-Agent": UA}, timeout=8)
+    r.raise_for_status()
+    j = r.json()
+    if int(j.get("responseStatus", 0)) != 200:
+        raise RuntimeError(j.get("responseDetails", "erro MyMemory"))
+    out = (j.get("responseData") or {}).get("translatedText", "").strip()
+    if not out or "MYMEMORY WARNING" in out.upper():
+        raise RuntimeError("limite diário do MyMemory")
+    return out
+
+
+class OfflineNLLB:
+    """Tradução offline hebraico -> português com NLLB-200 (Meta) via CTranslate2."""
+    MODEL_REPO = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
+    SPM_REPO = "facebook/nllb-200-distilled-600M"
+
+    def __init__(self, on_status):
+        import ctranslate2
+        import sentencepiece as spm
+        from huggingface_hub import snapshot_download, hf_hub_download
+        on_status("Baixando/carregando tradutor offline (~600 MB na 1ª vez)…")
+        path = snapshot_download(self.MODEL_REPO)
+        spm_path = os.path.join(path, "sentencepiece.bpe.model")
+        if not os.path.exists(spm_path):
+            spm_path = hf_hub_download(self.SPM_REPO, "sentencepiece.bpe.model")
+        self.sp = spm.SentencePieceProcessor(model_file=spm_path)
+        self.tr = ctranslate2.Translator(path, device="cpu", compute_type="int8",
+                                         inter_threads=1, intra_threads=2)
+        log("tradutor offline carregado")
 
     def __call__(self, text):
-        for attempt in range(2):
+        src = ["heb_Hebr"] + self.sp.encode(text, out_type=str) + ["</s>"]
+        res = self.tr.translate_batch([src], target_prefix=[["por_Latn"]],
+                                      beam_size=2, max_decoding_length=256)
+        toks = res[0].hypotheses[0]
+        if toks and toks[0] == "por_Latn":
+            toks = toks[1:]
+        return self.sp.decode(toks).strip()
+
+
+class Translator:
+    """
+    Modos:
+      auto    -> Google; se falhar, MyMemory; se falhar, offline (NLLB)
+      online  -> só Google/MyMemory
+      offline -> só NLLB (não precisa de internet)
+    Serviço que falha fica "de castigo" por um tempo e o próximo é usado.
+    """
+
+    def __init__(self, mode, on_status):
+        self.mode = mode
+        self.on_status = on_status
+        self.offline = None
+        self.offline_failed = False
+        self.cooldown = {}
+        self.last_used = None
+        if mode == "offline":
+            self._get_offline()
+
+    def _get_offline(self):
+        if self.offline is None and not self.offline_failed:
             try:
-                out = self.tr.translate(text)
+                self.offline = OfflineNLLB(self.on_status)
+            except Exception:
+                self.offline_failed = True
+                log("falha no tradutor offline:", traceback.format_exc())
+        return self.offline
+
+    def __call__(self, text):
+        providers = []
+        if self.mode in ("auto", "online"):
+            providers += [("Google", tr_google, 120), ("MyMemory", tr_mymemory, 600)]
+        if self.mode in ("auto", "offline"):
+            providers.append(("Offline", None, 0))
+        now = time.time()
+        for name, fn, penalty in providers:
+            if self.cooldown.get(name, 0) > now:
+                continue
+            try:
+                if fn is None:
+                    off = self._get_offline()
+                    if off is None:
+                        continue
+                    out = off(text)
+                else:
+                    out = fn(text)
                 if out:
+                    self.last_used = name
                     return out
             except Exception as e:
-                log("erro tradução:", e)
-                time.sleep(0.5)
+                log(f"erro tradução ({name}):", e)
+                self.cooldown[name] = time.time() + penalty
         return None
 
 
@@ -307,9 +415,14 @@ def load_model(name, device_pref, on_status):
         list(m.transcribe(np.zeros(16000, dtype=np.float32), language="he")[0])
         return m
 
-    order = ["cuda", "cpu"] if device_pref == "auto" else [device_pref]
-    if device_pref == "cuda":
-        order = ["cuda", "cpu"]
+    order = ["cpu"]
+    if device_pref in ("auto", "cuda"):
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                order = ["cuda", "cpu"]
+        except Exception:
+            pass
     last = None
     for dev in order:
         try:
@@ -322,6 +435,210 @@ def load_model(name, device_pref, on_status):
             last = e
             log(f"falha ao carregar em {dev}:", traceback.format_exc())
     raise RuntimeError(f"Não foi possível carregar o modelo: {last}")
+
+
+# ---- Motor 1: faster-whisper (CPU ou NVIDIA) ------------------------------
+
+class FasterWhisperBackend:
+    def __init__(self, cfg, on_status):
+        self.model, self.dev = load_model(cfg["model"], cfg["device"], on_status)
+        self.label = "GPU NVIDIA" if self.dev == "cuda" else "CPU"
+        self.slow = self.dev != "cuda"
+
+    def transcribe(self, audio16, prompt):
+        segments, _ = self.model.transcribe(
+            audio16, language="he", task="transcribe",
+            beam_size=5 if self.dev == "cuda" else 1,
+            vad_filter=True, vad_parameters=dict(min_silence_duration_ms=300),
+            condition_on_previous_text=False, initial_prompt=prompt or None,
+            without_timestamps=True, no_speech_threshold=0.6,
+        )
+        out = []
+        for s in segments:
+            if s.no_speech_prob > 0.6 and s.avg_logprob < -1.0:
+                continue
+            if s.compression_ratio > 2.4:
+                continue
+            out.append(s.text.strip())
+        return " ".join(t for t in out if t).strip()
+
+    def close(self):
+        pass
+
+
+# ---- Motor 2: whisper.cpp com Vulkan (placas AMD / Intel / NVIDIA) --------
+
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def whisper_server_exe():
+    p = os.path.join(app_dir(), "whispercpp", "whisper-server.exe")
+    return p if os.path.exists(p) else None
+
+
+# Modelos de hebraico (ivrit.ai) no formato do whisper.cpp, em ordem de preferência
+GGML_SOURCES = [
+    ("ivrit-ai/whisper-large-v3-turbo-ggml", "ggml-model.bin"),                       # oficial, f16, 1,5 GB
+    ("RozzaCreat/whisper-large-v3-turbo-he-ggml", "ivrit-ai-whisper-large-v3-turbo-q4_k.bin"),  # 450 MB
+]
+
+
+def get_ggml_model(cfg, on_status):
+    local = (cfg.get("ggml_model_path") or "").strip()
+    if local and os.path.exists(local):
+        return local
+    from huggingface_hub import hf_hub_download
+    last = None
+    for repo, fname in GGML_SOURCES:
+        try:
+            on_status("Baixando modelo de hebraico para a placa de vídeo (1ª vez, ~1,5 GB)…")
+            return hf_hub_download(repo, fname)
+        except Exception as e:
+            last = e
+            log(f"falha baixando {repo}/{fname}:", e)
+    raise RuntimeError(f"Não consegui baixar o modelo GGML: {last}")
+
+
+def wav_bytes(audio16):
+    import io
+    import wave
+    pcm = (np.clip(audio16, -1, 1) * 32767).astype("<i2").tobytes()
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(pcm)
+    return bio.getvalue()
+
+
+class WhisperCppBackend:
+    """Roda o whisper-server.exe (compilado com Vulkan) e conversa com ele por HTTP local."""
+
+    def __init__(self, cfg, on_status):
+        import socket
+        import subprocess
+        import requests
+        self.requests = requests
+        exe = whisper_server_exe()
+        if not exe:
+            raise RuntimeError("whisper-server.exe não encontrado")
+        model = get_ggml_model(cfg, on_status)
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        self.port = s.getsockname()[1]
+        s.close()
+        self.url = f"http://127.0.0.1:{self.port}"
+
+        self.server_log = os.path.join(CFG_DIR, "whisper-server.log")
+        logf = open(self.server_log, "w", encoding="utf-8", errors="replace")
+        args = [exe, "-m", model, "-l", "he", "--host", "127.0.0.1", "--port", str(self.port),
+                "-t", str(max(2, min(6, (os.cpu_count() or 4) - 2))), "-nlp", "-sns"]
+        if cfg.get("device") == "cpu":
+            args.append("-ng")
+        log("iniciando:", " ".join(args))
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self.proc = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT,
+                                     cwd=os.path.dirname(exe), creationflags=flags)
+
+        on_status("Carregando modelo na placa de vídeo (Vulkan)…")
+        t0 = time.time()
+        while True:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"whisper-server fechou (código {self.proc.returncode}); veja whisper-server.log")
+            try:
+                if requests.get(self.url + "/health", timeout=1).status_code == 200:
+                    break
+            except Exception:
+                pass
+            if time.time() - t0 > 180:
+                self.close()
+                raise RuntimeError("whisper-server não respondeu em 3 min")
+            time.sleep(0.5)
+
+        self.label = self._detect_gpu()
+        self.slow = self.label == "CPU"
+        self.audio_ctx = bool(cfg.get("fast_encoder", False))
+        # aquecimento (a 1ª execução no Vulkan compila os shaders)
+        on_status(f"Preparando {self.label}…")
+        try:
+            self.transcribe(np.zeros(16000, dtype=np.float32), "")
+        except Exception as e:
+            log("aquecimento falhou:", e)
+
+    def _detect_gpu(self):
+        try:
+            with open(self.server_log, "r", encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+            for line in txt.splitlines():
+                if "ggml_vulkan: 0 =" in line:
+                    name = line.split("=", 1)[1].split("(")[0].strip()
+                    return f"GPU Vulkan: {name}"
+            if "Vulkan" in txt and "no GPU found" not in txt:
+                return "GPU Vulkan"
+        except Exception:
+            pass
+        return "CPU"
+
+    def transcribe(self, audio16, prompt):
+        data = {
+            "language": "he",
+            "response_format": "verbose_json",
+            "temperature": "0.0",
+            "temperature_inc": "0.2",
+            "beam_size": "1" if self.slow else "5",
+            "no_timestamps": "true",
+            "no_language_probabilities": "true",
+            "suppress_non_speech": "true",
+        }
+        if prompt:
+            data["prompt"] = prompt
+        if self.audio_ctx:
+            # Encoder encurtado: processa só a parte da janela de 30 s que tem áudio
+            secs = len(audio16) / 16000.0
+            data["audio_ctx"] = str(int(min(1500, max(256, secs * 50 + 64))))
+        files = {"file": ("trecho.wav", wav_bytes(audio16), "audio/wav")}
+        r = self.requests.post(self.url + "/inference", data=data, files=files, timeout=120)
+        r.raise_for_status()
+        j = r.json()
+        if "error" in j:
+            raise RuntimeError(j["error"])
+        out = []
+        for s in j.get("segments", []):
+            nsp = float(s.get("no_speech_prob", 0) or 0)
+            alp = float(s.get("avg_logprob", 0) or 0)
+            if nsp > 0.6 and alp < -1.0:
+                continue
+            out.append(str(s.get("text", "")).strip())
+        if not j.get("segments"):
+            out = [str(j.get("text", "")).strip()]
+        return " ".join(t for t in out if t).strip()
+
+    def close(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+def create_backend(cfg, on_status):
+    eng = cfg.get("engine", "auto")
+    if eng in ("auto", "vulkan") and whisper_server_exe():
+        try:
+            return WhisperCppBackend(cfg, on_status)
+        except Exception as e:
+            log("falha no motor Vulkan:", traceback.format_exc())
+            on_status(f"Placa de vídeo falhou ({e}); usando o processador…")
+            time.sleep(2)
+    return FasterWhisperBackend(cfg, on_status)
 
 
 class Engine:
@@ -355,33 +672,43 @@ class Engine:
 
     def _run(self):
         try:
-            model, dev = load_model(self.cfg["model"], self.cfg["device"], self.status)
+            backend = create_backend(self.cfg, self.status)
         except Exception as e:
+            log("erro carregando motor:", traceback.format_exc())
             self.status(f"Erro: {e}")
             self.ui_q.put(("error", str(e)))
             return
+        self.backend = backend
         if self.stop_evt.is_set():
+            backend.close()
             return
 
-        try:
-            translator = Translator()
-        except Exception as e:
-            self.status(f"Erro no tradutor: {e}")
-            return
+        # A tradução roda numa thread separada para não atrasar o reconhecimento
+        self.tr_q = queue.Queue()
+        threading.Thread(target=self._translate_loop, daemon=True).start()
 
         self.capture = AudioCapture(self.audio_q, self.cfg["loopback_device"], self.status)
         self.capture.start()
         self.capture.ready.wait(10)
         if self.capture.error or not self.capture.rate:
+            backend.close()
             return
         rate = self.capture.rate
-        dev_txt = "GPU" if dev == "cuda" else "CPU"
+        dev_txt = backend.label
         self.status(f"● Ouvindo ({dev_txt})")
 
+        try:
+            self._loop(backend, rate, dev_txt)
+        finally:
+            backend.close()
+
+    def _loop(self, backend, rate, dev_txt):
         buf = np.zeros(0, dtype=np.float32)
         last_audio = time.time()
         prev_text = ""
-        target = float(self.cfg["chunk_seconds"])
+        base_target = float(self.cfg["chunk_seconds"])
+        target = base_target
+        proc_ema = None  # tempo médio que o Whisper leva por trecho
 
         while not self.stop_evt.is_set():
             got = False
@@ -422,36 +749,46 @@ class Engine:
             audio16 = to_16k(chunk, rate)
             t0 = time.time()
             try:
-                segments, _ = model.transcribe(
-                    audio16,
-                    language="he",
-                    task="transcribe",
-                    beam_size=5 if dev == "cuda" else 2,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=300),
-                    condition_on_previous_text=False,
-                    initial_prompt=prev_text[-200:] or None,
-                    without_timestamps=True,
-                    no_speech_threshold=0.6,
-                )
-                parts = []
-                for s in segments:
-                    if s.no_speech_prob > 0.6 and s.avg_logprob < -1.0:
-                        continue
-                    if s.compression_ratio > 2.4:
-                        continue
-                    parts.append(s.text.strip())
-                he = " ".join(p for p in parts if p).strip()
+                he = backend.transcribe(audio16, prev_text[-200:])
             except Exception as e:
-                log("erro no Whisper:", traceback.format_exc())
+                log("erro no reconhecimento:", traceback.format_exc())
                 self.status(f"Erro no reconhecimento: {e}")
+                time.sleep(1)
                 continue
 
+            # O Whisper sempre processa uma janela de 30 s, então cada trecho
+            # custa quase o mesmo tempo, curto ou longo. Se o PC demora mais
+            # que o tamanho do trecho, aumenta o trecho para não acumular atraso.
+            proc = time.time() - t0
+            proc_ema = proc if proc_ema is None else 0.7 * proc_ema + 0.3 * proc
+            new_target = min(20.0, max(base_target, proc_ema * 1.15))
+            if abs(new_target - target) > 0.5:
+                target = new_target
+                extra = "" if target <= base_target + 0.1 else f" - trechos de {target:.0f}s (PC lento)"
+                self.status(f"● Ouvindo ({dev_txt}){extra}")
+
+            he = clean_text(he)
             if not he or is_hallucination(he):
+                log(f"[{proc:.1f}s] (descartado) {he}")
                 continue
             prev_text = he
-            pt = translator(he)
-            log(f"[{time.time() - t0:.1f}s] HE: {he} | PT: {pt}")
+            log(f"[{proc:.1f}s / áudio {len(chunk) / rate:.1f}s] HE: {he}")
+            self.tr_q.put(he)
+
+    def _translate_loop(self):
+        try:
+            translator = Translator(self.cfg.get("translator", "auto"), self.status)
+        except Exception as e:
+            log("erro tradutor:", traceback.format_exc())
+            self.status(f"Erro no tradutor: {e}")
+            translator = None
+        while not self.stop_evt.is_set():
+            try:
+                he = self.tr_q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            pt = translator(he) if translator else None
+            log(f"PT ({translator.last_used if translator else '-'}): {pt}")
             self.ui_q.put(("text", he, pt))
 
 
@@ -633,7 +970,7 @@ class Overlay(tk.Tk):
 
     def apply_settings(self, new_cfg):
         restart = any(new_cfg[k] != self.cfg[k] for k in
-                      ("model", "device", "loopback_device", "chunk_seconds"))
+                      ("model", "device", "loopback_device", "chunk_seconds", "translator", "engine", "fast_encoder"))
         self.cfg.update(new_cfg)
         save_cfg(self.cfg)
         self.attributes("-alpha", float(self.cfg["opacity"]))
@@ -663,7 +1000,7 @@ class SettingsWindow(tk.Toplevel):
         self.resizable(False, False)
         pad = dict(padx=10, pady=5, sticky="w")
 
-        ttk.Label(self, text="Modelo de reconhecimento:").grid(row=0, column=0, **pad)
+        ttk.Label(self, text="Modelo (faster-whisper):").grid(row=0, column=0, **pad)
         self.model_var = tk.StringVar(value=cfg["model"])
         names = [m for m, _ in MODELS]
         cb = ttk.Combobox(self, textvariable=self.model_var, values=names, width=42)
@@ -709,8 +1046,35 @@ class SettingsWindow(tk.Toplevel):
         ttk.Checkbutton(self, text="Mostrar também o texto em hebraico",
                         variable=self.orig_var).grid(row=9, column=0, columnspan=2, **pad)
 
+        ttk.Label(self, text="Tradução:").grid(row=10, column=0, **pad)
+        self.tr_labels = {
+            "auto": "Automática (Google → MyMemory → offline)",
+            "online": "Só online (Google / MyMemory)",
+            "offline": "Só offline (NLLB, sem internet)",
+        }
+        self.tr_var = tk.StringVar(value=self.tr_labels.get(cfg.get("translator", "auto")))
+        ttk.Combobox(self, textvariable=self.tr_var, values=list(self.tr_labels.values()),
+                     state="readonly", width=42).grid(row=10, column=1, **pad)
+
+        ttk.Label(self, text="Motor de reconhecimento:").grid(row=11, column=0, **pad)
+        self.eng_labels = {
+            "auto": "Automático (placa de vídeo Vulkan, senão processador)",
+            "vulkan": "whisper.cpp + Vulkan (AMD RX / Intel / NVIDIA)",
+            "faster-whisper": "faster-whisper (processador ou NVIDIA CUDA)",
+        }
+        self.eng_var = tk.StringVar(value=self.eng_labels.get(cfg.get("engine", "auto")))
+        ttk.Combobox(self, textvariable=self.eng_var, values=list(self.eng_labels.values()),
+                     state="readonly", width=42).grid(row=11, column=1, **pad)
+        if not whisper_server_exe():
+            ttk.Label(self, text="(whisper-server.exe não encontrado nesta instalação)",
+                      foreground="#a00").grid(row=12, column=1, padx=10, sticky="w")
+
+        self.fast_var = tk.BooleanVar(value=bool(cfg.get("fast_encoder", False)))
+        ttk.Checkbutton(self, text="Modo rápido da placa de vídeo (encoder encurtado; pode errar um pouco mais)",
+                        variable=self.fast_var).grid(row=13, column=0, columnspan=2, **pad)
+
         btns = ttk.Frame(self)
-        btns.grid(row=10, column=0, columnspan=2, pady=10)
+        btns.grid(row=14, column=0, columnspan=2, pady=10)
         ttk.Button(btns, text="Salvar", command=self.save).pack(side="left", padx=5)
         ttk.Button(btns, text="Cancelar", command=self.destroy).pack(side="left", padx=5)
 
@@ -726,6 +1090,11 @@ class SettingsWindow(tk.Toplevel):
                 "opacity": round(float(self.op_var.get()), 2),
                 "clear_after": int(self.clear_var.get()),
                 "show_original": bool(self.orig_var.get()),
+                "translator": next((k for k, v in self.tr_labels.items()
+                                    if v == self.tr_var.get()), "auto"),
+                "engine": next((k for k, v in self.eng_labels.items()
+                                if v == self.eng_var.get()), "auto"),
+                "fast_encoder": bool(self.fast_var.get()),
             }
         except Exception as e:
             messagebox.showerror(APP, f"Valor inválido: {e}", parent=self)
