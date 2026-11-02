@@ -4,12 +4,46 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  VULKAN_VERSION: 1.4.357.0
+  # versão do whisper.cpp testada com o LegendaViva
+  WHISPER_CPP_COMMIT: 482279b8a18855ba741d7b88c30fcb3874691f59
+
 jobs:
   build:
-    runs-on: windows-2022
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- whisper.cpp com Vulkan (placas AMD Radeon) ----------
+      - name: Instalar Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Baixar whisper.cpp
+        run: |
+          git init whispercpp-src
+          cd whispercpp-src
+          git remote add origin https://github.com/ggml-org/whisper.cpp
+          git fetch --depth 1 origin $env:WHISPER_CPP_COMMIT
+          git checkout FETCH_HEAD
+
+      - name: Compilar whisper-server (Vulkan)
+        working-directory: whispercpp-src
+        run: |
+          cmake -B build `
+            -DGGML_VULKAN=ON `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON `
+            -DWHISPER_BUILD_TESTS=OFF `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          cmake --build build --config Release --target whisper-server -j 4
+          dir build\bin\Release
+
+      # ---------- App Python ----------
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -27,12 +61,18 @@ jobs:
           --collect-all onnxruntime
           --collect-all av
           --collect-all tokenizers
-          --collect-data deep_translator
+          --collect-all sentencepiece
+          --collect-all hf_xet
           --hidden-import pyaudiowpatch
           legendaviva.py
 
-      - name: Copiar LEIA-ME
-        run: copy LEIA-ME.md dist\LegendaViva\
+      - name: Montar pacote
+        run: |
+          New-Item -ItemType Directory -Force dist\LegendaViva\whispercpp | Out-Null
+          Copy-Item whispercpp-src\build\bin\Release\whisper-server.exe dist\LegendaViva\whispercpp\
+          Get-ChildItem whispercpp-src\build\bin\Release\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination dist\LegendaViva\whispercpp\
+          Copy-Item LEIA-ME.md dist\LegendaViva\
+          dir dist\LegendaViva\whispercpp
 
       - uses: actions/upload-artifact@v4
         with:
