@@ -220,11 +220,11 @@ def decide_cut(buf, rate, target_s, flush=False):
         return n * frame
 
     # Só silêncio/ruído baixíssimo: descarta tudo
-    if dur >= 1.0 and e.max() < 0.003:
+    if dur >= 1.0 and e.max() < 0.0008:
         return n * frame
 
     smooth = np.convolve(e, np.ones(5) / 5, mode="same")
-    thr = max(0.002, 0.35 * float(np.percentile(e, 50)))
+    thr = max(0.0005, 0.35 * float(np.percentile(e, 50)))
     quiet = smooth < thr
 
     # 1) Pausa de >= 400 ms no fim depois de fala suficiente -> corta já
@@ -631,6 +631,11 @@ class WhisperCppBackend:
 
 def create_backend(cfg, on_status):
     eng = cfg.get("engine", "auto")
+    expected = os.path.join(app_dir(), "whispercpp", "whisper-server.exe")
+    log(f"motor: {eng} | whisper-server: {expected} existe={os.path.exists(expected)}")
+    if eng in ("auto", "vulkan") and not whisper_server_exe():
+        on_status("Placa de vídeo indisponível: falta a pasta 'whispercpp' ao lado do LegendaViva.exe")
+        time.sleep(4)
     if eng in ("auto", "vulkan") and whisper_server_exe():
         try:
             return WhisperCppBackend(cfg, on_status)
@@ -651,6 +656,8 @@ class Engine:
         self.stop_evt = threading.Event()
         self.paused = threading.Event()
         self.capture = None
+        self.n_chunks = 0
+        self.n_silent = 0
         self.worker = threading.Thread(target=self._run, daemon=True)
 
     def status(self, msg):
@@ -725,6 +732,7 @@ class Engine:
                     buf = np.zeros(0, dtype=np.float32)
                     continue
                 buf = np.concatenate([buf] + blocks)
+                self._report_level(blocks)
 
             # O loopback não manda nada quando o PC está mudo:
             # se parou de chegar áudio, processa o que sobrou.
@@ -743,10 +751,17 @@ class Engine:
                 continue
             chunk, buf = buf[:cut], buf[cut:]
 
-            if float(np.sqrt(np.mean(chunk * chunk))) < 0.002:
+            rms = float(np.sqrt(np.mean(chunk * chunk)))
+            if rms < 0.0005:
+                self.n_silent += 1
                 continue  # silêncio
+            self.n_chunks += 1
 
             audio16 = to_16k(chunk, rate)
+            # normaliza o volume (áudio baixo atrapalha o reconhecimento)
+            peak = float(np.max(np.abs(audio16))) or 1.0
+            if peak < 0.5:
+                audio16 = (audio16 * min(20.0, 0.5 / peak)).astype(np.float32)
             t0 = time.time()
             try:
                 he = backend.transcribe(audio16, prev_text[-200:])
@@ -774,6 +789,20 @@ class Engine:
             prev_text = he
             log(f"[{proc:.1f}s / áudio {len(chunk) / rate:.1f}s] HE: {he}")
             self.tr_q.put(he)
+
+    def _report_level(self, blocks):
+        lvl = max(float(np.sqrt(np.mean(b * b))) for b in blocks if len(b))
+        self.level_peak = max(getattr(self, "level_peak", 0.0), lvl)
+        now = time.time()
+        if now - getattr(self, "last_level_ui", 0) > 0.25:
+            self.ui_q.put(("level", self.level_peak))
+            self.level_peak = 0.0
+            self.last_level_ui = now
+        if now - getattr(self, "last_level_log", now) > 15:
+            log(f"nível de áudio ~{lvl:.4f} | trechos enviados: {self.n_chunks} | silêncio: {self.n_silent}")
+            self.last_level_log = now
+        elif not hasattr(self, "last_level_log"):
+            self.last_level_log = now
 
     def _translate_loop(self):
         try:
@@ -872,9 +901,12 @@ class Overlay(tk.Tk):
         self._update_wrap()
 
     def _update_wrap(self):
-        w = max(200, self.winfo_width() - 40)
-        self.text_lbl.configure(wraplength=w)
-        self.orig_lbl.configure(wraplength=w)
+        try:
+            w = max(200, self.winfo_width() - 40)
+            self.text_lbl.configure(wraplength=w)
+            self.orig_lbl.configure(wraplength=w)
+        except tk.TclError:
+            pass
 
     # ---- motor ---------------------------------------------------------
     def start_engine(self):
@@ -890,7 +922,11 @@ class Overlay(tk.Tk):
                 item = self.ui_q.get_nowait()
                 kind = item[0]
                 if kind == "status":
-                    self.status_lbl.configure(text=item[1])
+                    self.status_txt = item[1]
+                    self._show_status()
+                elif kind == "level":
+                    self.level = item[1]
+                    self._show_status()
                 elif kind == "text":
                     _, he, pt = item
                     self.lines.append((he, pt or f"(sem tradução) {he}"))
@@ -905,6 +941,19 @@ class Overlay(tk.Tk):
         if clear_after and self.lines and time.time() - self.last_text_time > clear_after:
             self.clear()
         self.after(100, self._poll)
+
+    def _show_status(self):
+        txt = getattr(self, "status_txt", "")
+        lvl = getattr(self, "level", None)
+        if lvl is not None:
+            # escala em dB: -60 dB = vazio, 0 dB = cheio
+            import math
+            db = 20 * math.log10(max(lvl, 1e-6))
+            n = int(max(0, min(10, (db + 60) / 6)))
+            bar = "▮" * n + "▯" * (10 - n)
+            aviso = "  (sem som chegando!)" if db < -60 else ""
+            txt = f"{txt}    áudio {bar}{aviso}"
+        self.status_lbl.configure(text=txt)
 
     def _render(self):
         self.text_lbl.configure(text="\n".join(pt for _, pt in self.lines))
