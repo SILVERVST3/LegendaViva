@@ -69,7 +69,7 @@ DEFAULTS = {
     "device": "auto",          # auto / cuda / cpu
     "translator": "auto",      # auto / online / offline
     "engine": "auto",          # auto (Vulkan se existir) / vulkan / faster-whisper
-    "fast_encoder": False,     # whisper.cpp: encoder encurtado (NÃO recomendado p/ turbo)
+    "fast_encoder": True,      # whisper.cpp: encoder encurtado COM verificação automática
     "partials": True,          # legenda provisória enquanto a frase é falada
     "partial_step": 0.5,       # s de áudio novo entre passadas provisórias
     "ggml_model_path": "",     # opcional: caminho de um .bin GGML já baixado
@@ -84,7 +84,7 @@ DEFAULTS = {
 }
 
 
-CFG_VERSION = 2
+CFG_VERSION = 3
 
 
 def load_cfg():
@@ -94,12 +94,15 @@ def load_cfg():
             cfg.update(json.load(f))
     except Exception:
         pass
-    if int(cfg.get("cfg_version", 1)) < CFG_VERSION:
+    ver = int(cfg.get("cfg_version", 1))
+    if ver < 2:
         # v2: legenda provisória -> frases maiores dão tradução melhor sem aumentar o atraso
         cfg["chunk_seconds"] = DEFAULTS["chunk_seconds"]
-        cfg["fast_encoder"] = False
         cfg["partials"] = True
-        cfg["cfg_version"] = CFG_VERSION
+    if ver < 3:
+        # v3: encoder encurtado agora tem verificação automática -> ligado por padrão
+        cfg["fast_encoder"] = True
+    cfg["cfg_version"] = CFG_VERSION
     return cfg
 
 
@@ -258,6 +261,28 @@ def decide_cut(buf, rate, target_s, flush=False):
     return None
 
 
+def decide_cut_eager(buf, rate, min_s):
+    """
+    Corte "assim que a placa fica livre": se já há pelo menos min_s segundos de
+    fala, procura o ponto mais silencioso (entre palavras) no fim do buffer e
+    corta ali, sem esperar uma pausa longa. Evita a placa ficar parada esperando.
+    """
+    e, frame = frame_energy(buf, rate)
+    n = len(e)
+    if n * FRAME_S < min_s:
+        return None
+    smooth = np.convolve(e, np.ones(5) / 5, mode="same")
+    lo = int(min_s * 0.7 / FRAME_S)
+    hi = n - int(0.08 / FRAME_S)
+    if hi <= lo:
+        return None
+    idx = lo + int(np.argmin(smooth[lo:hi]))
+    thr = max(0.0005, 0.45 * float(np.median(e)))
+    if smooth[idx] < thr:
+        return idx * frame
+    return None
+
+
 def to_16k(x, rate):
     """Converte para 16 kHz mono com um filtro passa-baixa simples."""
     if rate == 16000:
@@ -324,6 +349,82 @@ def tr_google(text):
     r.raise_for_status()
     data = r.json()
     return "".join(seg[0] for seg in data[0] if seg and seg[0]).strip()
+
+
+_SESSION2 = None
+_POOL = None
+_ALT_FAILS = 0
+
+
+def _http2():
+    global _SESSION2
+    if _SESSION2 is None:
+        import requests
+        _SESSION2 = requests.Session()
+        _SESSION2.headers["User-Agent"] = UA
+    return _SESSION2
+
+
+def tr_google_alt(text):
+    """Segundo endereço do Google Tradutor (o usado por extensões do Chrome)."""
+    r = _http2().get("https://clients5.google.com/translate_a/t",
+                     params={"client": "dict-chrome-ex", "sl": "iw", "tl": "pt", "q": text},
+                     timeout=5)
+    r.raise_for_status()
+    j = r.json()
+    # formatos possíveis: ["tradução"], [["tradução","iw"]], {"sentences":[{"trans":..}]}
+    if isinstance(j, dict):
+        out = "".join(x.get("trans", "") for x in j.get("sentences", []))
+    elif isinstance(j, list) and j:
+        first = j[0]
+        out = first if isinstance(first, str) else (first[0] if isinstance(first, list) and first else "")
+    else:
+        out = ""
+    out = (out or "").strip()
+    if not out:
+        raise RuntimeError("resposta vazia (Google alt)")
+    return out
+
+
+def tr_google_hedged(text, hedge_after=0.7):
+    """
+    Pedido "com reserva": manda ao endereço principal; se não responder em
+    hedge_after segundos, manda também ao endereço alternativo e usa a
+    resposta que chegar primeiro. Corta os atrasos ocasionais de 2-3 s.
+    """
+    global _POOL, _ALT_FAILS
+    import concurrent.futures as cf
+    if _POOL is None:
+        _POOL = cf.ThreadPoolExecutor(max_workers=3)
+    f1 = _POOL.submit(tr_google, text)
+    try:
+        return f1.result(timeout=hedge_after)
+    except cf.TimeoutError:
+        pass
+    except Exception:
+        if _ALT_FAILS >= 5:
+            raise
+    if _ALT_FAILS >= 5:          # endereço alternativo não funciona nesta rede
+        return f1.result(timeout=6)
+    f2 = _POOL.submit(tr_google_alt, text)
+    pending = {f1, f2}
+    last_err = None
+    while pending:
+        done, pending = cf.wait(pending, timeout=6, return_when=cf.FIRST_COMPLETED)
+        if not done:
+            break
+        for f in done:
+            try:
+                out = f.result()
+                if f is f2:
+                    _ALT_FAILS = 0
+                return out
+            except Exception as e:
+                last_err = e
+                if f is f2:
+                    _ALT_FAILS += 1
+                    log("Google alt falhou:", e)
+    raise last_err or RuntimeError("Google não respondeu")
 
 
 def tr_mymemory(text):
@@ -413,7 +514,7 @@ class Translator:
     def _translate(self, text, partial):
         providers = []
         if self.mode in ("auto", "online"):
-            providers.append(("Google", tr_google, 120))
+            providers.append(("Google", tr_google_hedged, 120))
             if not partial:
                 providers.append(("MyMemory", tr_mymemory, 600))
         if self.mode == "offline" or (self.mode == "auto" and (not partial or self.offline)):
@@ -557,16 +658,54 @@ def wav_bytes(audio16):
 class WhisperCppBackend:
     """Roda o whisper-server.exe (compilado com Vulkan) e conversa com ele por HTTP local."""
 
-    def __init__(self, cfg, on_status):
-        import socket
-        import subprocess
+    def __init__(self, cfg, on_status, on_save=None):
         import requests
         self.requests = requests
-        exe = whisper_server_exe()
-        if not exe:
+        self.session = requests.Session()
+        self.exe = whisper_server_exe()
+        if not self.exe:
             raise RuntimeError("whisper-server.exe não encontrado")
-        model = get_ggml_model(cfg, on_status)
+        self.model = get_ggml_model(cfg, on_status)
+        self.cfg = cfg
+        self.proc = None
+        self.audio_ctx = bool(cfg.get("fast_encoder", True))
+        self.final_beam = 1
+        self.lp_hist = deque(maxlen=40)
+        self.fast_n = 0
+        self.fast_redo = 0
 
+        # Calibração (só 1 vez por placa/modelo): mede se o flash attention
+        # deixa ESTA placa mais rápida ou mais lenta e guarda a escolha.
+        key = f"{os.path.basename(self.model)}|{os.path.getsize(self.model)}|{os.path.getmtime(self.exe):.0f}"
+        calib = cfg.get("vk_calib") or {}
+        if calib.get("key") == key and "flash_attn" in calib:
+            self._start(bool(calib["flash_attn"]), on_status)
+        else:
+            on_status("Calibrando a placa de vídeo (só na 1ª vez, ~1 min)…")
+            self._start(True, on_status)
+            t_fa = self.bench()
+            log(f"calibração: flash attention LIGADO = {t_fa:.2f}s por passada")
+            fa = True
+            if not self.slow:
+                self.close()
+                self._start(False, on_status)
+                t_nofa = self.bench()
+                log(f"calibração: flash attention DESLIGADO = {t_nofa:.2f}s por passada")
+                if t_nofa < t_fa * 0.95:
+                    fa = False
+                else:
+                    self.close()
+                    self._start(True, on_status)
+            calib = {"key": key, "flash_attn": fa,
+                     "t_fa": round(t_fa, 3), "t_nofa": round(t_nofa, 3) if not self.slow else None}
+            log("calibração escolhida:", calib)
+            if on_save:
+                on_save({"vk_calib": calib})
+        self.final_beam = 1 if self.slow else 3
+
+    def _start(self, flash_attn, on_status):
+        import socket
+        import subprocess
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
         self.port = s.getsockname()[1]
@@ -575,14 +714,15 @@ class WhisperCppBackend:
 
         self.server_log = os.path.join(CFG_DIR, "whisper-server.log")
         logf = open(self.server_log, "w", encoding="utf-8", errors="replace")
-        args = [exe, "-m", model, "-l", "he", "--host", "127.0.0.1", "--port", str(self.port),
-                "-t", str(max(2, min(6, (os.cpu_count() or 4) - 2))), "-nlp", "-sns"]
-        if cfg.get("device") == "cpu":
+        args = [self.exe, "-m", self.model, "-l", "he", "--host", "127.0.0.1", "--port", str(self.port),
+                "-t", str(max(2, min(6, (os.cpu_count() or 4) - 2))), "-nlp", "-sns",
+                "-fa" if flash_attn else "-nfa"]
+        if self.cfg.get("device") == "cpu":
             args.append("-ng")
         log("iniciando:", " ".join(args))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.proc = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT,
-                                     cwd=os.path.dirname(exe), creationflags=flags)
+                                     cwd=os.path.dirname(self.exe), creationflags=flags)
 
         on_status("Carregando modelo na placa de vídeo (Vulkan)…")
         t0 = time.time()
@@ -590,26 +730,37 @@ class WhisperCppBackend:
             if self.proc.poll() is not None:
                 raise RuntimeError(f"whisper-server fechou (código {self.proc.returncode}); veja whisper-server.log")
             try:
-                if requests.get(self.url + "/health", timeout=1).status_code == 200:
+                if self.session.get(self.url + "/health", timeout=1).status_code == 200:
                     break
             except Exception:
                 pass
             if time.time() - t0 > 180:
                 self.close()
                 raise RuntimeError("whisper-server não respondeu em 3 min")
-            time.sleep(0.5)
+            time.sleep(0.3)
 
         self.label = self._detect_gpu()
         self.slow = self.label == "CPU"
-        self.final_beam = 1 if self.slow else 3
-        self.audio_ctx = bool(cfg.get("fast_encoder", False))
-        self.session = requests.Session()
         # aquecimento (a 1ª execução no Vulkan compila os shaders)
         on_status(f"Preparando {self.label}…")
         try:
-            self.transcribe(np.zeros(16000, dtype=np.float32), "")
+            self._infer(np.zeros(16000 * 2, dtype=np.float32), "", final=False)
         except Exception as e:
             log("aquecimento falhou:", e)
+
+    def bench(self, n=3):
+        """Tempo médio de uma passada (5 s de áudio silencioso: mede principalmente o encoder)."""
+        a = np.zeros(16000 * 5, dtype=np.float32)
+        ts = []
+        for _ in range(n):
+            t0 = time.time()
+            try:
+                self._infer(a, "", final=False)
+            except Exception as e:
+                log("bench falhou:", e)
+                return 999.0
+            ts.append(time.time() - t0)
+        return float(np.median(ts))
 
     def _detect_gpu(self):
         try:
@@ -625,7 +776,8 @@ class WhisperCppBackend:
             pass
         return "CPU"
 
-    def transcribe(self, audio16, prompt, final=True):
+    def _infer(self, audio16, prompt, final, audio_ctx=None):
+        """Uma passada no whisper-server. Retorna (texto, confiança média, n_segmentos)."""
         data = {
             "language": "he",
             "response_format": "verbose_json",
@@ -639,28 +791,72 @@ class WhisperCppBackend:
         }
         if prompt:
             data["prompt"] = prompt
-        if self.audio_ctx:
-            # Encoder encurtado: processa só a parte da janela de 30 s que tem áudio
-            secs = len(audio16) / 16000.0
-            data["audio_ctx"] = str(int(min(1500, max(256, secs * 50 + 64))))
+        if audio_ctx:
+            data["audio_ctx"] = str(int(audio_ctx))
         files = {"file": ("trecho.wav", wav_bytes(audio16), "audio/wav")}
         r = self.session.post(self.url + "/inference", data=data, files=files, timeout=120)
         r.raise_for_status()
         j = r.json()
         if "error" in j:
             raise RuntimeError(j["error"])
-        out = []
-        for s in j.get("segments", []):
-            nsp = float(s.get("no_speech_prob", 0) or 0)
-            alp = float(s.get("avg_logprob", 0) or 0)
+        out, lps = [], []
+        for seg in j.get("segments", []):
+            nsp = float(seg.get("no_speech_prob", 0) or 0)
+            alp = float(seg.get("avg_logprob", 0) or 0)
             if nsp > 0.6 and alp < -1.0:
                 continue
-            out.append(str(s.get("text", "")).strip())
+            t = str(seg.get("text", "")).strip()
+            if t:
+                out.append(t)
+                lps.append(alp)
         if not j.get("segments"):
             out = [str(j.get("text", "")).strip()]
-        return " ".join(t for t in out if t).strip()
+        text = " ".join(t for t in out if t).strip()
+        return text, (float(np.mean(lps)) if lps else 0.0), len(out)
+
+    # ---- encoder encurtado com verificação ---------------------------------
+    # Pesquisa (FUTO whisper-acft) e testes próprios: encurtar o encoder do
+    # modelo turbo deixa 2-4x mais rápido, mas às vezes o decodificador "se perde".
+    # Por isso cada resultado rápido é conferido; se parecer ruim, refaz completo.
+
+    def _looks_bad(self, text, lp, secs):
+        import zlib
+        if not text:
+            return False
+        b = text.encode("utf-8")
+        if len(b) > 40 and len(b) / max(1, len(zlib.compress(b))) > 2.4:
+            return True                      # texto repetitivo
+        if len(text) / max(secs, 0.5) > 32:
+            return True                      # texto demais para a duração do áudio
+        hist = self.lp_hist
+        ref = float(np.median(hist)) if len(hist) >= 8 else -0.30
+        return lp < min(-0.35, ref - 0.20)   # confiança bem abaixo do normal
+
+    def transcribe(self, audio16, prompt, final=True):
+        secs = len(audio16) / 16000.0
+        if not self.audio_ctx or secs > 26:
+            return self._infer(audio16, prompt, final)[0]
+        ctx = int(min(1500, max(256, secs * 50 + 128)))
+        text, lp, _ = self._infer(audio16, prompt, final, audio_ctx=ctx)
+        if not final:
+            return text                      # provisória: rápida, sem conferência
+        self.fast_n += 1
+        if self._looks_bad(text, lp, secs):
+            self.fast_redo += 1
+            full, lp_full, _ = self._infer(audio16, prompt, final)
+            log(f"modo rápido refeito (conf. {lp:.2f} -> {lp_full:.2f}): {text[:60]!r} -> {full[:60]!r}")
+            text = full
+        else:
+            self.lp_hist.append(lp)
+        # Se precisar refazer muito, o modo rápido não compensa: desliga sozinho
+        if self.fast_n >= 15 and self.fast_redo / self.fast_n > 0.35:
+            self.audio_ctx = False
+            log(f"modo rápido desligado: {self.fast_redo}/{self.fast_n} trechos refeitos")
+        return text
 
     def close(self):
+        if not self.proc:
+            return
         try:
             self.proc.terminate()
             self.proc.wait(5)
@@ -671,7 +867,7 @@ class WhisperCppBackend:
                 pass
 
 
-def create_backend(cfg, on_status):
+def create_backend(cfg, on_status, on_save=None):
     eng = cfg.get("engine", "auto")
     expected = os.path.join(app_dir(), "whispercpp", "whisper-server.exe")
     log(f"motor: {eng} | whisper-server: {expected} existe={os.path.exists(expected)}")
@@ -680,7 +876,7 @@ def create_backend(cfg, on_status):
         time.sleep(4)
     if eng in ("auto", "vulkan") and whisper_server_exe():
         try:
-            return WhisperCppBackend(cfg, on_status)
+            return WhisperCppBackend(cfg, on_status, on_save)
         except Exception as e:
             log("falha no motor Vulkan:", traceback.format_exc())
             on_status(f"Placa de vídeo falhou ({e}); usando o processador…")
@@ -725,7 +921,8 @@ class Engine:
 
     def _run(self):
         try:
-            backend = create_backend(self.cfg, self.status)
+            backend = create_backend(self.cfg, self.status,
+                                     lambda d: self.ui_q.put(("save_cfg", d)))
         except Exception as e:
             log("erro carregando motor:", traceback.format_exc())
             self.status(f"Erro: {e}")
@@ -784,7 +981,7 @@ class Engine:
         seg_id = 0
         last_part_len = 0
         last_part_text = ""
-        seg_start_time = None   # quando começou a chegar a fala da frase atual
+        partials_paused = False  # legenda provisória suspensa se a placa for lenta
 
         while not self.stop_evt.is_set():
             got = False
@@ -814,6 +1011,11 @@ class Engine:
 
             # ---------- passada FINAL ----------
             cut = decide_cut(buf, rate, target, flush=flush)
+            if cut is None and proc_final is not None and (not partials or partials_paused):
+                # A placa está livre agora: se já juntou áudio equivalente ao tempo
+                # de uma passada, corta entre palavras e processa (computacionalmente consciente).
+                eager_min = min(target, max(1.6, proc_final * 0.9))
+                cut = decide_cut_eager(buf, rate, eager_min)
             if cut is not None:
                 chunk, buf = buf[:cut], buf[cut:]
                 last_part_len = 0
@@ -839,7 +1041,7 @@ class Engine:
                 # Ajustes automáticos conforme a velocidade da placa/CPU
                 if hasattr(backend, "final_beam") and not backend.slow:
                     backend.final_beam = 3 if proc_final < 1.2 else 1
-                budget = proc_final + (proc_part or 0) * 1.5
+                budget = proc_final + (0 if (not partials or partials_paused) else (proc_part or 0) * 1.5)
                 new_target = min(20.0, max(base_target, budget * 1.15))
                 if abs(new_target - target) > 0.5:
                     target = new_target
@@ -859,7 +1061,7 @@ class Engine:
                 continue
 
             # ---------- passada PROVISÓRIA ----------
-            if not partials:
+            if not partials or partials_paused:
                 continue
             if len(buf) < int(rate * 0.8) or len(buf) - last_part_len < int(rate * step):
                 continue
@@ -877,6 +1079,11 @@ class Engine:
             proc = time.time() - t0
             proc_part = proc if proc_part is None else 0.7 * proc_part + 0.3 * proc
             last_part_len = len(buf)
+            if proc_part > 1.6 and not partials_paused:
+                # Cada passada demora demais: a legenda provisória só atrasaria a final
+                partials_paused = True
+                log(f"legenda provisória suspensa (placa leva {proc_part:.1f}s por passada)")
+                self.status(f"● Ouvindo ({dev_txt}) - legenda provisória desligada (placa lenta)")
             he = clean_text(he)
             if he and he != last_part_text and not is_hallucination(he):
                 last_part_text = he
@@ -1059,6 +1266,9 @@ class Overlay(tk.Tk):
                 if kind == "status":
                     self.status_txt = item[1]
                     self._show_status()
+                elif kind == "save_cfg":
+                    self.cfg.update(item[1])
+                    save_cfg(self.cfg)
                 elif kind == "level":
                     self.level = item[1]
                     self._show_status()
@@ -1275,7 +1485,7 @@ class SettingsWindow(tk.Toplevel):
                       foreground="#a00").grid(row=12, column=1, padx=10, sticky="w")
 
         self.fast_var = tk.BooleanVar(value=bool(cfg.get("fast_encoder", False)))
-        ttk.Checkbutton(self, text="Encoder encurtado (experimental, NÃO recomendado: erra muito com o modelo turbo)",
+        ttk.Checkbutton(self, text="Modo rápido da placa (encoder encurtado + verificação automática; 2–3× mais rápido)",
                         variable=self.fast_var).grid(row=13, column=0, columnspan=2, **pad)
 
         self.part_var = tk.BooleanVar(value=bool(cfg.get("partials", True)))

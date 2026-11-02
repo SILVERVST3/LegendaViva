@@ -26,20 +26,23 @@ O LegendaViva ouve o som que está tocando no PC (navegador, VLC, qualquer coisa
 | Menu (pausar, mostrar hebraico, configurações, sair) | botão direito |
 
 ## Como o atraso foi reduzido
-- **Legenda provisória (cinza)**: enquanto a pessoa fala, o app reconhece de novo o áudio da frase toda vez que a placa fica livre, e mostra a tradução provisória em cinza. Quando a frase termina, faz uma passada final mais caprichada e o texto fica **branco**. Técnica baseada no Whisper-Streaming (Universidade Carlos, Praga).
-- O ritmo das passadas se ajusta sozinho à velocidade da placa: nunca acumula atraso.
-- Frases cortadas nas pausas da fala (300 ms), para não partir palavras.
-- Tradução com conexão reaproveitada (sem refazer a conexão segura a cada frase) e cache: se a frase final é igual à última provisória, a tradução é instantânea.
-- Passadas provisórias usam decodificação gulosa e sem re-tentativas; a final usa beam search quando a placa dá conta.
+Medições no PC com RX 580: cada passada do Whisper levava ~4 s, quase toda no *encoder* (a RX 580 não tem meia precisão no driver Vulkan: `fp16: 0`). A tradução do Google levava 1,2–3 s.
+
+- **Modo rápido da placa (padrão)**: o encoder processa só a parte da janela de 30 s que tem áudio (`audio_ctx`). Nos testes ficou 2,5–4,5× mais rápido. Como isso às vezes faz o modelo "se perder" (pesquisa FUTO whisper-acft e testes próprios), **cada resultado é conferido** (confiança, repetição, tamanho do texto); se parecer ruim, o trecho é refeito com a janela cheia. Se precisar refazer mais de 35% dos trechos, o modo rápido se desliga sozinho.
+- **Calibração automática** (só na 1ª vez, ~1 min): mede se o *flash attention* deixa a placa mais rápida ou mais lenta e guarda a melhor opção.
+- **Corte assim que a placa fica livre**: em vez de esperar uma pausa longa, o app corta entre palavras quando já juntou áudio equivalente a uma passada. A placa não fica parada.
+- **Tradução com reserva**: se o Google não responder em 0,7 s, um segundo endereço do Google é chamado em paralelo e vale a primeira resposta.
+- **Legenda provisória (cinza)**: opcional. Desliga sozinha se a placa for lenta demais para ela.
+
+Simulação com os tempos medidos no seu PC: atraso médio fala→legenda caiu de ~9 s para ~5 s.
 
 ## Placa de vídeo
-- **whisper.cpp + Vulkan** (padrão): usa a placa AMD Radeon (ex.: RX 580). A barra mostra "GPU Vulkan: <placa>". Mantenha o driver **AMD Adrenalin** atualizado.
+- **whisper.cpp + Vulkan** (padrão): usa a placa AMD Radeon. A barra mostra "GPU Vulkan: <placa>". Mantenha o driver **AMD Adrenalin** atualizado.
 - **faster-whisper**: processador (ou NVIDIA com CUDA), usado como reserva.
-- "Encoder encurtado" ficou como **experimental e desligado**: pesquisas mostram que com o modelo turbo ele multiplica os erros.
 
 ## Ajuste fino
-- **Tamanho máx. da frase**: com legenda provisória, 5–8 s é o ideal (frases maiores = tradução melhor, sem aumentar o atraso).
-- No `log.txt`, as linhas `[parcial X s]` e `[final X s]` mostram quanto a placa leva por passada.
+- Se achar que a qualidade caiu, desligue o **Modo rápido da placa** em Configurações e compare.
+- No `log.txt`: `[final X s]` = tempo por passada; `modo rápido refeito` = trechos conferidos e refeitos; `calibração` = resultado da calibração.
 
 ## Arquivos
 Configuração e logs ficam em `%APPDATA%\LegendaViva\` (menu → "Abrir pasta do log"). Se algo der errado, mande o `log.txt` e o `whisper-server.log`.
